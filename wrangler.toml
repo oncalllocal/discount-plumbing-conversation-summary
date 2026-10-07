@@ -1,0 +1,23 @@
+# Discount Plumbing: conversation summary. Secrets are NOT stored here (wrangler secret put …).
+name = "discount-plumbing-summary"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+BUSINESS_NAME = "Discount Plumbing"
+CLAUDE_MODEL = "claude-sonnet-5"
+# Date stamps use the contact's own time zone when GHL has one, else this. CHANGE IF DISCOUNT PLUMBING ISN'T IN CENTRAL TIME.
+SUMMARY_TIMEZONE = "America/Chicago"
+SUMMARY_CHANNELS = "sms"
+GHL_TAG_SUMMARY = "conversation-summary-ready"
+GHL_TAG_SUMMARY_FAILED = "conversation-summary-failed"
+
+# Run records + per-contact locks. Create with: wrangler kv namespace create STATE, then paste the id below.
+[[kv_namespaces]]
+binding = "STATE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[observability]
+enabled = true
