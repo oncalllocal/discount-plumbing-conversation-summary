@@ -14,10 +14,10 @@ SUMMARY_CHANNELS = "sms"
 GHL_TAG_SUMMARY = "conversation-summary-ready"
 GHL_TAG_SUMMARY_FAILED = "conversation-summary-failed"
 
-# Run records + per-contact locks. Create with: wrangler kv namespace create STATE, then paste the id below.
+# Run records + per-contact locks (namespace: discount-plumbing-summary-state).
 [[kv_namespaces]]
 binding = "STATE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "3e944bab4e9e4478a2679e8efb60fd6f"
 
 [observability]
 enabled = true
