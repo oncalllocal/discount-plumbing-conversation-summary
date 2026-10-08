@@ -634,3 +634,115 @@ describe("look-back window", () => {
     }
   });
 });
+
+// ───────────────────────── tag-triggered runs ─────────────────────────
+
+describe("trigger tag cleanup (remove_tag)", () => {
+  const NOW = () => new Date("2026-10-07T20:00:00Z");
+  const TRIGGER = "send-summary";
+  const trigDeletes = (calls: Calls) => calls.ghl.filter((c) => c.method === "DELETE" && c.path.endsWith("/tags") && JSON.stringify(c.body) === JSON.stringify({ tags: [TRIGGER] }));
+
+  it("removes the trigger tag after a successful run, so adding it again fires the GHL workflow again", async () => {
+    const { env } = mkEnv();
+    const calls = stubNetwork();
+    const r = await summarizeContact(env, CID, { now: NOW, removeTag: TRIGGER });
+    expect(r.status).toBe("ok");
+    expect(trigDeletes(calls)).toHaveLength(1);
+    // ...and only after the output was written, never before
+    const order = calls.ghl.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.path.split("/").pop()}`);
+    expect(order.at(-1)).toBe("DELETE tags");
+    expect(order.indexOf("PUT " + CID)).toBeLessThan(order.lastIndexOf("DELETE tags"));
+  });
+
+  it("also removes it when the run is unchanged, empty or fails, so the button always resets", async () => {
+    const { env } = mkEnv();
+    stubNetwork();
+    await summarizeContact(env, CID, { now: NOW });
+    const unchanged = stubNetwork({ contact: { customFields: [{ id: "f1", value: "existing" }] } });
+    expect((await summarizeContact(env, CID, { now: NOW, removeTag: TRIGGER })).status).toBe("unchanged");
+    expect(trigDeletes(unchanged)).toHaveLength(1);
+
+    const { env: e2 } = mkEnv();
+    const empty = stubNetwork({ pages: [[]] });
+    expect((await summarizeContact(e2, CID, { now: NOW, removeTag: TRIGGER })).status).toBe("empty");
+    expect(trigDeletes(empty)).toHaveLength(1);
+
+    const { env: e3 } = mkEnv();
+    const failed = stubNetwork({ searchStatus: 403 });
+    expect((await summarizeContact(e3, CID, { now: NOW, removeTag: TRIGGER })).status).toBe("error");
+    expect(trigDeletes(failed)).toHaveLength(1);
+  });
+
+  it("leaves it alone on a dry run and when another run for the contact is in progress", async () => {
+    const { env, r2 } = mkEnv();
+    const calls = stubNetwork();
+    await summarizeContact(env, CID, { now: NOW, dryRun: true, removeTag: TRIGGER });
+    expect(trigDeletes(calls)).toHaveLength(0);
+    r2.store.set(`lock:${CID}`, String(Date.now()));
+    expect((await summarizeContact(env, CID, { now: NOW, removeTag: TRIGGER })).status).toBe("in_progress");
+    expect(trigDeletes(calls)).toHaveLength(0);
+  });
+
+  it("never touches tags when no trigger tag is given", async () => {
+    const { env } = mkEnv();
+    const calls = stubNetwork();
+    await summarizeContact(env, CID, { now: NOW });
+    // only the output tag's remove-then-add refire
+    expect(calls.ghl.filter((c) => c.method === "DELETE").every((c) => JSON.stringify(c.body) === '{"tags":["conversation-summary-ready"]}')).toBe(true);
+  });
+
+  it("a failure removing the tag doesn't lose the result", async () => {
+    const { env } = mkEnv();
+    stubNetwork();
+    const orig = globalThis.fetch;
+    vi.stubGlobal("fetch", async (url: string, init: RequestInit = {}) => (init.method === "DELETE" && String(init.body).includes(TRIGGER) ? new Response("nope", { status: 500 }) : orig(url, init)));
+    const r = await summarizeContact(env, CID, { now: NOW, removeTag: TRIGGER });
+    expect(r.status).toBe("ok");
+    expect(r.wrote).toEqual({ field: true, note: true, tag: true });
+  });
+
+  describe("endpoint", () => {
+    const post = (body: unknown, qs = "") => new Request(`https://x.dev/summarize?token=secret${qs}`, { method: "POST", body: JSON.stringify(body) });
+
+    it("takes remove_tag from the body, query or customData and removes that tag", async () => {
+      for (const [body, qs] of [[{ contact_id: CID, remove_tag: TRIGGER }, ""], [{ contact_id: CID }, `&remove_tag=${TRIGGER}`], [{ customData: { contact_id: CID, remove_tag: ` ${TRIGGER} ` } }, ""]] as const) {
+        const { env } = mkEnv();
+        const calls = stubNetwork();
+        const res = await handle(post({ ...body, wait: true }, qs), env);
+        expect(res.status).toBe(200);
+        expect(trigDeletes(calls)).toHaveLength(1);
+      }
+    });
+
+    it("refuses the tool's own output tags (they would loop the workflows or defeat the email trigger)", async () => {
+      const { env } = mkEnv();
+      stubNetwork();
+      for (const t of ["conversation-summary-ready", "Conversation-Summary-Failed"]) {
+        const res = await handle(post({ contact_id: CID, remove_tag: t }), env);
+        expect(res.status).toBe(400);
+        expect(((await res.json()) as { error: string }).error).toMatch(/output tags/);
+      }
+      const { env: e2 } = mkEnv({ GHL_TAG_SUMMARY: "client-ready" });
+      expect((await handle(post({ contact_id: CID, remove_tag: "client-ready" }), e2)).status).toBe(400);
+    });
+
+    it("rejects a non-text or oversized remove_tag", async () => {
+      const { env } = mkEnv();
+      stubNetwork();
+      expect((await handle(post({ contact_id: CID, remove_tag: 5 }), env)).status).toBe(400);
+      expect((await handle(post({ contact_id: CID, remove_tag: { a: 1 } }), env)).status).toBe(400);
+      expect((await handle(post({ contact_id: CID, remove_tag: "x".repeat(101) }), env)).status).toBe(400);
+    });
+
+    it("works with the default 202-and-background mode too", async () => {
+      const { env } = mkEnv();
+      const calls = stubNetwork();
+      const pending: Promise<unknown>[] = [];
+      const ctx = { waitUntil: (p: Promise<unknown>) => pending.push(p), passThroughOnException() {} } as unknown as ExecutionContext;
+      const res = await handle(post({ contact_id: CID, remove_tag: TRIGGER, force: true }), env, ctx);
+      expect(res.status).toBe(202);
+      await Promise.all(pending);
+      expect(trigDeletes(calls)).toHaveLength(1);
+    });
+  });
+});

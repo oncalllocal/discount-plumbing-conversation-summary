@@ -1,7 +1,7 @@
 /**
  * Discount Plumbing: conversation summary Worker.
  *
- *   POST /summarize            {contact_id, days?, wait?, dry_run?, force?}  summarise a contact's texts into its
+ *   POST /summarize            {contact_id, days?, remove_tag?, wait?, dry_run?, force?}  summarise a contact's texts into its
  *                              Conversation Summary field + note + tag. 202 and background by default.
  *                              (/api/conversation-summary is an alias.) GHL webhook payload shapes accepted.
  *   GET  /status/:contactId    the last run for a contact
@@ -54,7 +54,14 @@ async function summarize(req: Request, env: Env, ctx?: ExecutionContext): Promis
   const rawDays = raw.days ?? url.searchParams.get("days") ?? (raw.customData as Loose | undefined)?.days;
   const days = parseWindowDays(rawDays);
   if (rawDays !== undefined && rawDays !== null && String(rawDays).trim() !== "" && days === null) return jsonResponse({ error: "days must be a whole number from 1 to 3650, or 0 / \"all\" for no limit" }, 400);
-  const opts = { force: flag("force"), dryRun: flag("dry_run"), days: days ?? undefined };
+  const rawTag = raw.remove_tag ?? url.searchParams.get("remove_tag") ?? (raw.customData as Loose | undefined)?.remove_tag;
+  const removeTag = typeof rawTag === "string" ? rawTag.trim() : "";
+  if (rawTag !== undefined && rawTag !== null && typeof rawTag !== "string") return jsonResponse({ error: "remove_tag must be a text tag name" }, 400);
+  if (removeTag.length > 100) return jsonResponse({ error: "remove_tag is too long" }, 400);
+  // Removing the output tag would defeat it, and a trigger that is also the output tag would loop the workflows.
+  const protectedTags = [env.GHL_TAG_SUMMARY || "conversation-summary-ready", env.GHL_TAG_SUMMARY_FAILED || "conversation-summary-failed"].map((t) => t.toLowerCase());
+  if (removeTag && protectedTags.includes(removeTag.toLowerCase())) return jsonResponse({ error: `remove_tag can't be "${removeTag}": that is one of this tool's own output tags. Use a different tag to trigger the summary.` }, 400);
+  const opts = { force: flag("force"), dryRun: flag("dry_run"), days: days ?? undefined, removeTag: removeTag || undefined };
   if (flag("wait") || opts.dryRun || !ctx) {
     const r = await summarizeContact(env, contactId, opts);
     return jsonResponse(r, r.status === "error" ? 502 : 200);

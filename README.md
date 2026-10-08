@@ -71,16 +71,48 @@ curl -X POST -H "x-summary-token: $SUMMARY_TOKEN" https://<worker-url>/summarize
 
 ### 4. GHL workflows
 
-1. **Trigger the summary.** Trigger = whatever means "send this lead to the client" (a tag, a pipeline stage, a button). Action = Webhook, `POST https://<worker-url>/summarize?token=<SUMMARY_TOKEN>` with custom data `contact_id` = `{{contact.id}}` (the standard `contact_id` GHL sends also works).
-2. **Send it to the client.** Trigger = Contact Tag Added `conversation-summary-ready`. Action = email the client with `{{contact.conversation_summary}}` plus the lead's details. The tag is added last, so the field is always filled by then, and it re-fires on every run.
-3. Optional: trigger on `conversation-summary-failed` to alert yourself.
+Two workflows. The first is a "button": adding a tag compiles the summary. The second sends it to the client.
+
+**Pick two different tags.** The *trigger* tag is yours (this guide uses `send-summary`; any name works). The *output* tag, `conversation-summary-ready`, is added by this tool when the summary is done. They must not be the same tag, or the workflows would trigger each other. The tool refuses to use its own output tags as the trigger tag.
+
+**Workflow 1: compile the summary when the trigger tag is added**
+
+1. Automation → Workflows → Create workflow → Start from scratch. Name it e.g. "Compile conversation summary".
+2. Add trigger → **Contact Tag** → filter: *Tag added* → *Has tag* → `send-summary`.
+3. Add action → **Webhook** (under Custom/Integrations; in some accounts "Custom Webhook").
+   - Method: `POST`
+   - URL: `https://<worker-url>/summarize?token=<SUMMARY_TOKEN>`
+   - Custom data (key → value):
+
+     | Key | Value |
+     |---|---|
+     | `contact_id` | `{{contact.id}}` |
+     | `remove_tag` | `send-summary` |
+     | `force` | `true` |
+
+   Leave the default headers and body. The standard GHL payload also carries `contact_id`, so the custom data is belt-and-braces.
+4. Save and **Publish** the workflow (the toggle in the top right).
+
+What those do:
+- `remove_tag` takes `send-summary` off the contact when the run finishes (success, nothing to summarise, or error). GHL only fires "Tag Added" for a tag that is new on the contact, so without this, adding the tag a second time would do nothing. Don't add your own "Remove Tag" step instead: the tool removes it at the right moment, after the summary exists.
+- `force` makes every tag add produce a fresh summary, note and `conversation-summary-ready` tag, even if no new texts arrived since last time. Adding the tag is an explicit request, so it always re-runs (and re-sends). Leave it out if you'd rather a repeat with no new texts do nothing. The webhook answers in a fraction of a second and the work runs in the background, so GHL doesn't retry and you won't get duplicates.
+
+**Workflow 2: send it to the client**
+
+1. New workflow, trigger **Contact Tag** → *Tag added* → `conversation-summary-ready`.
+2. Add action **Send Email** (to the client) with the lead's details plus the merge field **`{{contact.conversation_summary}}`** (the Conversation Summary custom field). That field is always filled before the tag is added.
+3. Publish.
+
+Optional: a third workflow on `conversation-summary-failed` that alerts you (the run couldn't read the texts or Claude failed; `GET /status/<contactId>` has the reason).
+
+**Test it:** open a test contact that has some texts, add the tag `send-summary`, and within about 30 seconds the Conversation Summary field, a note and `conversation-summary-ready` appear and `send-summary` disappears. Add it again to confirm it re-runs.
 
 ## API
 
 All routes except `/healthz` need `SUMMARY_TOKEN` (`?token=`, `x-summary-token` header, or Bearer).
 
 ```
-POST /summarize          {contact_id, days?, wait?, dry_run?, force?}   202 + background by default; wait/dry_run hold the response
+POST /summarize          {contact_id, days?, remove_tag?, wait?, dry_run?, force?}   202 + background by default; wait/dry_run hold the response
 GET  /status/:contactId  the last run (status, message count, summary, what was written, errors)
 POST /fields             create the two GHL custom fields if missing
 GET  /check              read-only probe of the token's scopes
@@ -88,6 +120,8 @@ GET  /healthz
 ```
 
 `days` is the look-back window: a whole number from 1 to 3650, or `0` / `"all"` for no limit (default `SUMMARY_WINDOW_DAYS`, 35). It can also be sent as `?days=` or in `customData`. A bad value returns 400. A contact with no texts inside the window gets status `empty` (no field, note or tag).
+
+`remove_tag` is the GHL tag that triggered the run; it is removed from the contact when the run finishes (not on a dry run) so adding it again fires again. It can't be one of this tool's own output tags (400). Also accepted as `?remove_tag=` or in `customData`.
 
 `/api/conversation-summary` is an alias of `/summarize` (and of `/status/:id`).
 
@@ -98,7 +132,7 @@ Settings (`wrangler.toml`): `SUMMARY_WINDOW_DAYS` (default `35`), `SUMMARY_CHANN
 ```bash
 npm install --legacy-peer-deps
 npx tsc -p .      # type-check
-npx vitest run    # 47 tests: GHL paging / filtering, look-back window, date stamping, validation, pipeline, routes
+npx vitest run    # 56 tests: GHL paging / filtering, look-back window, date stamping, validation, pipeline, routes
 ```
 
 Notes: the per-contact lock uses KV, which is eventually consistent, so it stops a retried webhook running twice but isn't a strict mutex. Run records expire after 90 days.

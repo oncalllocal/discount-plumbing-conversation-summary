@@ -11,7 +11,7 @@
  */
 import { callTool, type ToolDef } from "./ai/claude";
 import type { Env } from "./env";
-import { addNote, ensureContactFields, getContact, refireTags, setCustomFields } from "./ghl/client";
+import { addNote, ensureContactFields, getContact, refireTags, removeTags, setCustomFields } from "./ghl/client";
 import { fetchContactHistory, parseChannels, type Channel, type HistoryMessage } from "./ghl/conversations";
 import { clean, errorMessage, sha256, truncate } from "./lib/util";
 
@@ -325,6 +325,11 @@ export interface SummarizeOptions {
   dryRun?: boolean;
   /** Look-back window in days (0 = no limit); defaults to SUMMARY_WINDOW_DAYS, else 35. */
   days?: number;
+  /**
+   * The GHL tag that triggered this run. Removed once the run finishes (whatever the outcome, unless it was
+   * a dry run or another run for the contact was already in progress) so adding it again fires the workflow again.
+   */
+  removeTag?: string;
   now?: () => Date;
 }
 
@@ -340,16 +345,20 @@ export async function summarizeContact(env: Env, contactId: string, opts: Summar
   const lock = await env.STATE.get(lockKey(contactId));
   if (lock && Date.now() - Number(lock) < LOCK_MS) return { ...rec, status: "in_progress" };
   await env.STATE.put(lockKey(contactId), String(Date.now()), { expirationTtl: 120 });
+  let result: SummaryRecord = rec;
   try {
-    return await run(env, contactId, rec, opts, now);
+    result = await run(env, contactId, rec, opts, now);
   } catch (e) {
     rec.status = "error";
     rec.error = errorMessage(e);
     console.error(`conversation summary failed for ${contactId}: ${rec.error}`);
-    return await finish(env, rec, opts);
+    result = await finish(env, rec, opts);
   } finally {
     await env.STATE.delete(lockKey(contactId)).catch(() => undefined);
   }
+  // GHL only fires "Tag Added" for a tag that is new on the contact, so take the trigger tag off again.
+  if (opts.removeTag && !opts.dryRun) await removeTags(env, contactId, [opts.removeTag]).catch(() => undefined);
+  return result;
 }
 
 async function finish(env: Env, rec: SummaryRecord, opts: SummarizeOptions): Promise<SummaryRecord> {
