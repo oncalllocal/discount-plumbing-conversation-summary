@@ -1,7 +1,7 @@
 /**
  * Discount Plumbing: conversation summary Worker.
  *
- *   POST /summarize            {contact_id, wait?, dry_run?, force?}  summarise a contact's texts into its
+ *   POST /summarize            {contact_id, days?, wait?, dry_run?, force?}  summarise a contact's texts into its
  *                              Conversation Summary field + note + tag. 202 and background by default.
  *                              (/api/conversation-summary is an alias.) GHL webhook payload shapes accepted.
  *   GET  /status/:contactId    the last run for a contact
@@ -14,7 +14,7 @@
 import type { Env } from "./env";
 import { ensureContactFields, ghl } from "./ghl/client";
 import { jsonResponse, safeEqual } from "./lib/util";
-import { getSummaryRecord, SUMMARY_FIELDS, summarizeContact } from "./summary";
+import { getSummaryRecord, parseWindowDays, SUMMARY_FIELDS, summarizeContact } from "./summary";
 
 type Loose = Record<string, unknown>;
 
@@ -51,7 +51,10 @@ async function summarize(req: Request, env: Env, ctx?: ExecutionContext): Promis
   if (!contactId) return jsonResponse({ error: "contact_id is required (the GHL contact's id)" }, 400);
   const url = new URL(req.url);
   const flag = (k: string) => truthy(raw[k]) || truthy(url.searchParams.get(k)) || truthy((raw.customData as Loose | undefined)?.[k]);
-  const opts = { force: flag("force"), dryRun: flag("dry_run") };
+  const rawDays = raw.days ?? url.searchParams.get("days") ?? (raw.customData as Loose | undefined)?.days;
+  const days = parseWindowDays(rawDays);
+  if (rawDays !== undefined && rawDays !== null && String(rawDays).trim() !== "" && days === null) return jsonResponse({ error: "days must be a whole number from 1 to 3650, or 0 / \"all\" for no limit" }, 400);
+  const opts = { force: flag("force"), dryRun: flag("dry_run"), days: days ?? undefined };
   if (flag("wait") || opts.dryRun || !ctx) {
     const r = await summarizeContact(env, contactId, opts);
     return jsonResponse(r, r.status === "error" ? 502 : 200);

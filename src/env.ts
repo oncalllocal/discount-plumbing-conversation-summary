@@ -15,6 +15,8 @@ export interface Env {
   SUMMARY_TIMEZONE?: string;
   /** Channels to read, comma-separated from sms,email,call,chat (default sms). */
   SUMMARY_CHANNELS?: string;
+  /** Only texts from the last N days are summarised (default 35; 0 or "all" = no limit). A request can override it with "days". */
+  SUMMARY_WINDOW_DAYS?: string;
   /** Tag added when the summary field is filled / when a run failed. */
   GHL_TAG_SUMMARY?: string;
   GHL_TAG_SUMMARY_FAILED?: string;

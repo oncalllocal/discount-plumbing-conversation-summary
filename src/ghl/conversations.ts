@@ -93,15 +93,19 @@ export interface HistoryResult {
  * conversations, oldest first. Fails closed: if any page can't be read the result is
  * an error rather than a silently partial history.
  */
-export async function fetchContactHistory(env: Env, contactId: string, channels: ReadonlySet<Channel>): Promise<HistoryResult> {
+export async function fetchContactHistory(env: Env, contactId: string, channels: ReadonlySet<Channel>, opts: { since?: string } = {}): Promise<HistoryResult> {
+  const since = opts.since && !Number.isNaN(Date.parse(opts.since)) ? new Date(opts.since).toISOString() : undefined;
+  const sinceMs = since ? Date.parse(since) : undefined;
   const loc = env.GHL_LOCATION_ID;
   if (!env.GHL_TOKEN || !loc) return { ok: false, error: "GHL_TOKEN / GHL_LOCATION_ID not set", messages: [], conversations: 0, truncated: false };
 
-  const search = await ghl(env, "GET", `/conversations/search?${new URLSearchParams({ locationId: loc, contactId, limit: String(MAX_CONVERSATIONS) })}`, undefined, CONVERSATIONS_VERSION);
+  const search = await ghl(env, "GET", `/conversations/search?${new URLSearchParams({ locationId: loc, contactId, limit: String(MAX_CONVERSATIONS), sortBy: "last_message_date", sort: "desc" })}`, undefined, CONVERSATIONS_VERSION);
   if (!search.ok) return { ok: false, error: `${search.error}${search.status === 401 || search.status === 403 ? " (token needs the conversations.readonly scope)" : ""}`, messages: [], conversations: 0, truncated: false };
-  const convos = ((search.data?.conversations || []) as { id?: string; contactId?: string }[])
+  const convos = ((search.data?.conversations || []) as { id?: string; contactId?: string; lastMessageDate?: number }[])
     // The search is already filtered by contact; this is belt-and-braces against ever summarising someone else's thread.
     .filter((c) => c.id && (!c.contactId || c.contactId === contactId))
+    // A conversation whose newest message is older than the window has nothing to contribute.
+    .filter((c) => sinceMs === undefined || typeof c.lastMessageDate !== "number" || c.lastMessageDate >= sinceMs)
     .slice(0, MAX_CONVERSATIONS);
 
   const byId = new Map<string, HistoryMessage>();
@@ -121,8 +125,10 @@ export async function fetchContactHistory(env: Env, contactId: string, channels:
       const raw = block.messages || [];
       for (const m of raw) {
         const n = normalizeMessage(m, channels);
-        if (n) byId.set(n.id, n);
+        if (n && (!since || n.at >= since)) byId.set(n.id, n);
       }
+      // Pages come newest first: once a page reaches back past the window, everything after it is older still.
+      if (since && raw.some((m) => m.dateAdded && Date.parse(m.dateAdded) < Date.parse(since))) break;
       // Stop when GHL says it's the last page, the page is empty, or the cursor isn't advancing.
       if (!block.nextPage || !raw.length || !block.lastMessageId || block.lastMessageId === lastMessageId) break;
       lastMessageId = block.lastMessageId;

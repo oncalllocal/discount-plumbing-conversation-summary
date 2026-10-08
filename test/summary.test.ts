@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { channelOf, fetchContactHistory, normalizeMessage, parseChannels, type HistoryMessage } from "../src/ghl/conversations";
-import { entryStamp, fitTranscript, formatDay, formatStamp, getSummaryRecord, pickTimeZone, renderSummary, summarizeContact, transcriptLines, validateSummary, type SummaryData } from "../src/summary";
+import { DEFAULT_WINDOW_DAYS, entryStamp, fitTranscript, parseWindowDays, formatDay, formatStamp, getSummaryRecord, pickTimeZone, renderSummary, summarizeContact, transcriptLines, validateSummary, type SummaryData } from "../src/summary";
 import { handle, summaryContactId } from "../src/index";
 import type { Env } from "../src/env";
 
@@ -222,7 +222,9 @@ describe("transcript + rendering", () => {
     expect(out).not.toContain("Location");
     expect(out).not.toContain("NEXT STEP");
     expect(out).toContain("OUTCOME: Booked.");
-    expect(out).toContain("Based on 5 text messages, Oct 3, 2026 – Oct 4, 2026. Last message Oct 4, 2026, 9:30 AM CDT.");
+    expect(out).toContain("Based on 5 text messages (Oct 3, 2026 – Oct 4, 2026). Last message Oct 4, 2026, 9:30 AM CDT.");
+    expect(renderSummary(data, msgs, { leadName: "Jane Doe", tz: TZ, generatedAt: "", windowDays: 35 })).toContain("Based on 5 text messages from the last 35 days (Oct 3, 2026 – Oct 4, 2026).");
+    expect(renderSummary(data, msgs, { leadName: "", tz: TZ, generatedAt: "", windowDays: 1 })).toContain("from the last 1 day (");
   });
   it("shows a day range when an entry spans days, and years when the thread does", () => {
     expect(entryStamp(msgs, 1, 5, TZ, false)).toBe("Oct 3 – Oct 4");
@@ -521,5 +523,114 @@ describe("util", () => {
   it("the Anthropic prompt names the business", async () => {
     const { systemPrompt } = await import("../src/summary");
     expect(systemPrompt("Discount Plumbing")).toContain("BUSINESS = Discount Plumbing");
+  });
+});
+
+// ───────────────────────── look-back window ─────────────────────────
+
+describe("look-back window", () => {
+  const NOW = () => new Date("2026-10-07T20:00:00Z"); // 35 days earlier = 2026-09-02T20:00Z
+  const OLD = [
+    raw("o1", "2026-04-03T21:00:00Z", "Old thread: do you do AC tune-ups?"),
+    raw("o2", "2026-04-03T21:01:00Z", "Yes! $59 special. Want to book?", "outbound"),
+    raw("o3", "2026-08-30T15:00:00Z", "Promo: fall special", "outbound"),
+    raw("edge-out", "2026-09-02T19:59:00Z", "just outside the window"),
+    raw("edge-in", "2026-09-02T20:01:00Z", "just inside the window"),
+  ];
+  const RECENT = MESSAGES; // Oct 3–4
+  const newestFirst = (...lists: unknown[][]) => lists.flat().sort((a: any, b: any) => b.dateAdded.localeCompare(a.dateAdded));
+
+  it("parses the window setting", () => {
+    expect(DEFAULT_WINDOW_DAYS).toBe(35);
+    expect([parseWindowDays(35), parseWindowDays("35"), parseWindowDays(" 7 "), parseWindowDays(3650)]).toEqual([35, 35, 7, 3650]);
+    expect([parseWindowDays(0), parseWindowDays("0"), parseWindowDays("all"), parseWindowDays("None")]).toEqual([0, 0, 0, 0]);
+    for (const bad of [undefined, null, "", "abc", -3, "-3", 3651, 1.5, "1.5", "35 days", NaN]) expect(parseWindowDays(bad)).toBeNull();
+  });
+
+  it("only reads messages inside the window and stops paging once it reaches past it", async () => {
+    const { env } = mkEnv();
+    const all = newestFirst(OLD, RECENT);
+    // Pages of 3, newest first. Page 2 is the first to reach back past the cutoff (it holds "edge-out"), so page 3 must never be requested.
+    const pages = [all.slice(0, 3), all.slice(3, 6), all.slice(6, 9), all.slice(9)];
+    const calls = stubNetwork({ pages });
+    const h = await fetchContactHistory(env, CID, new Set(["sms"] as const), { since: "2026-09-02T20:00:00.000Z" });
+    expect(h.ok).toBe(true);
+    expect(h.messages.map((m) => m.id)).toEqual(["edge-in", "m1", "m2", "m3", "m4", "m5"]);
+    expect(h.truncated).toBe(false);
+    const pageCalls = calls.ghl.filter((c) => c.path.includes("/messages"));
+    expect(pageCalls.length).toBe(3);
+    expect(pageCalls.some((c) => c.path.includes("lastMessageId=page3"))).toBe(false);
+  });
+
+  it("skips conversations whose newest message is older than the window, and sorts the search newest first", async () => {
+    const { env } = mkEnv();
+    const since = "2026-09-02T20:00:00.000Z";
+    const calls = stubNetwork({ conversations: [{ id: "recent", contactId: CID, lastMessageDate: Date.parse("2026-10-04T14:30:00Z") }, { id: "ancient", contactId: CID, lastMessageDate: Date.parse("2026-03-01T00:00:00Z") }] });
+    await fetchContactHistory(env, CID, new Set(["sms"] as const), { since });
+    expect(calls.ghl.some((c) => c.path.includes("/conversations/ancient/"))).toBe(false);
+    expect(calls.ghl.some((c) => c.path.includes("/conversations/recent/"))).toBe(true);
+    expect(calls.ghl[0].path).toContain("sortBy=last_message_date");
+    // no window → everything is read
+    const all = stubNetwork({ conversations: [{ id: "ancient", contactId: CID, lastMessageDate: Date.parse("2026-03-01T00:00:00Z") }] });
+    await fetchContactHistory(env, CID, new Set(["sms"] as const));
+    expect(all.ghl.some((c) => c.path.includes("/conversations/ancient/"))).toBe(true);
+  });
+
+  it("summarizes the last 35 days by default and tells Claude (and the reader) so", async () => {
+    const { env } = mkEnv();
+    const calls = stubNetwork({ pages: [newestFirst(OLD, RECENT)], summary: { headline: "h", lead: { looking_for: "", location: "", timing: "", contact_preference: "" }, timeline: [{ from: 1, to: 2, summary: "s" }], outcome: "o", next_step: "" } });
+    const r = await summarizeContact(env, CID, { now: NOW });
+    expect(r.status).toBe("ok");
+    expect(r.windowDays).toBe(35);
+    expect(r.messages).toBe(6); // edge-in + the five recent; the April thread and the Aug 30 promo are out of scope
+    const prompt = JSON.stringify(calls.claude[0]);
+    expect(prompt).not.toContain("Old thread");
+    expect(prompt).not.toContain("fall special");
+    expect(prompt).toContain("just inside the window");
+    expect(prompt).not.toContain("just outside the window");
+    expect(prompt).toContain("last 35 days only");
+    expect(r.summary).toContain("from the last 35 days");
+  });
+
+  it("a request can widen, narrow or remove the window, and SUMMARY_WINDOW_DAYS sets the default", async () => {
+    const { env } = mkEnv();
+    stubNetwork({ pages: [newestFirst(OLD, RECENT)] });
+    expect((await summarizeContact(env, CID, { now: NOW, dryRun: true, days: 0 })).messages).toBe(10); // no limit: everything
+    expect((await summarizeContact(env, CID, { now: NOW, dryRun: true, days: 5 })).messages).toBe(5); // Oct 3 onwards
+    expect((await summarizeContact(env, CID, { now: NOW, dryRun: true, days: 200 })).messages).toBe(10); // back to April
+    const { env: e2 } = mkEnv({ SUMMARY_WINDOW_DAYS: "5" });
+    stubNetwork({ pages: [newestFirst(OLD, RECENT)] });
+    expect((await summarizeContact(e2, CID, { now: NOW, dryRun: true })).windowDays).toBe(5);
+    const { env: e3 } = mkEnv({ SUMMARY_WINDOW_DAYS: "garbage" });
+    stubNetwork({ pages: [newestFirst(OLD, RECENT)] });
+    expect((await summarizeContact(e3, CID, { now: NOW, dryRun: true })).windowDays).toBe(35);
+    const { env: e4 } = mkEnv({ SUMMARY_WINDOW_DAYS: "all" });
+    stubNetwork({ pages: [newestFirst(OLD, RECENT)] });
+    expect((await summarizeContact(e4, CID, { now: NOW, dryRun: true })).windowDays).toBe(0);
+  });
+
+  it("nothing in the window means status empty: no Claude call, no writes", async () => {
+    const { env } = mkEnv();
+    const calls = stubNetwork({ pages: [newestFirst(OLD.slice(0, 3))] });
+    const r = await summarizeContact(env, CID, { now: NOW });
+    expect(r.status).toBe("empty");
+    expect(r.windowDays).toBe(35);
+    expect(calls.claude).toHaveLength(0);
+    expect(calls.ghl.some((c) => c.method !== "GET")).toBe(false);
+  });
+
+  it("the /summarize endpoint takes days (body, query or customData) and rejects nonsense", async () => {
+    const { env } = mkEnv();
+    stubNetwork({ pages: [newestFirst(OLD, RECENT)] });
+    const post = (body: unknown, qs = "") => new Request(`https://x.dev/summarize?token=secret${qs}`, { method: "POST", body: JSON.stringify(body) });
+    const ok = async (body: unknown, qs = "") => ((await (await handle(post(body, qs), env)).json()) as { windowDays: number; status: string });
+    expect((await ok({ contact_id: CID, dry_run: true, days: 5 })).windowDays).toBe(5);
+    expect((await ok({ contact_id: CID, dry_run: true }, "&days=7")).windowDays).toBe(7);
+    expect((await ok({ customData: { contact_id: CID, days: "all" }, dry_run: true })).windowDays).toBe(0);
+    expect((await ok({ contact_id: CID, dry_run: true })).windowDays).toBe(35);
+    for (const bad of ["abc", -1, 99999, "1.5"]) {
+      const r = await handle(post({ contact_id: CID, days: bad }), env);
+      expect(r.status).toBe(400);
+    }
   });
 });

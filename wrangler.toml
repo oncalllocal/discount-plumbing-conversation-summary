@@ -11,6 +11,8 @@ CLAUDE_MODEL = "claude-sonnet-5"
 # Date stamps use the contact's own time zone when GHL has one, else this. CHANGE IF DISCOUNT PLUMBING ISN'T IN CENTRAL TIME.
 SUMMARY_TIMEZONE = "America/Chicago"
 SUMMARY_CHANNELS = "sms"
+# Only texts from the last N days are summarised (older ones are ignored). 0 = no limit.
+SUMMARY_WINDOW_DAYS = "35"
 GHL_TAG_SUMMARY = "conversation-summary-ready"
 GHL_TAG_SUMMARY_FAILED = "conversation-summary-failed"
 
