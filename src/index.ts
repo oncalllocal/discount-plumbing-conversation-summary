@@ -1,7 +1,7 @@
 /**
  * Discount Plumbing: conversation summary Worker.
  *
- *   POST /summarize            {contact_id, days?, remove_tag?, wait?, dry_run?, force?}  summarise a contact's texts into its
+ *   POST /summarize            {contact_id, days?, photos?, remove_tag?, wait?, dry_run?, force?}  summarise a contact's texts into its
  *                              Conversation Summary field + note + tag. 202 and background by default.
  *                              (/api/conversation-summary is an alias.) GHL webhook payload shapes accepted.
  *   GET  /status/:contactId    the last run for a contact
@@ -14,6 +14,7 @@
 import type { Env } from "./env";
 import { ensureContactFields, ghl } from "./ghl/client";
 import { jsonResponse, safeEqual } from "./lib/util";
+import { parsePhotoMode } from "./photos";
 import { getSummaryRecord, parseWindowDays, SUMMARY_FIELDS, summarizeContact } from "./summary";
 
 type Loose = Record<string, unknown>;
@@ -61,7 +62,10 @@ async function summarize(req: Request, env: Env, ctx?: ExecutionContext): Promis
   // Removing the output tag would defeat it, and a trigger that is also the output tag would loop the workflows.
   const protectedTags = [env.GHL_TAG_SUMMARY || "conversation-summary-ready", env.GHL_TAG_SUMMARY_FAILED || "conversation-summary-failed"].map((t) => t.toLowerCase());
   if (removeTag && protectedTags.includes(removeTag.toLowerCase())) return jsonResponse({ error: `remove_tag can't be "${removeTag}": that is one of this tool's own output tags. Use a different tag to trigger the summary.` }, 400);
-  const opts = { force: flag("force"), dryRun: flag("dry_run"), days: days ?? undefined, removeTag: removeTag || undefined };
+  const rawPhotos = raw.photos ?? url.searchParams.get("photos") ?? (raw.customData as Loose | undefined)?.photos;
+  const photos = parsePhotoMode(rawPhotos);
+  if (rawPhotos !== undefined && rawPhotos !== null && String(rawPhotos).trim() !== "" && photos === null) return jsonResponse({ error: 'photos must be "describe", "links" or "off"' }, 400);
+  const opts = { force: flag("force"), dryRun: flag("dry_run"), days: days ?? undefined, removeTag: removeTag || undefined, photos: photos ?? undefined };
   if (flag("wait") || opts.dryRun || !ctx) {
     const r = await summarizeContact(env, contactId, opts);
     return jsonResponse(r, r.status === "error" ? 502 : 200);

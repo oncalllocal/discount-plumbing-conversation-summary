@@ -17,6 +17,8 @@ export interface Env {
   SUMMARY_CHANNELS?: string;
   /** Only texts from the last N days are summarised (default 65; 0 or "all" = no limit). A request can override it with "days". */
   SUMMARY_WINDOW_DAYS?: string;
+  /** Pictures (MMS): "describe" (default: list every photo with its link and have Claude describe the most recent), "links" (list only) or "off". A request can override it with "photos". */
+  SUMMARY_PHOTOS?: string;
   /** Tag added when the summary field is filled / when a run failed. */
   GHL_TAG_SUMMARY?: string;
   GHL_TAG_SUMMARY_FAILED?: string;

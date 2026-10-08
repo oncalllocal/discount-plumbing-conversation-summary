@@ -13,6 +13,8 @@ SUMMARY_TIMEZONE = "America/Chicago"
 SUMMARY_CHANNELS = "sms"
 # Only texts from the last N days are summarised (older ones are ignored). 0 = no limit.
 SUMMARY_WINDOW_DAYS = "65"
+# Pictures texted in: "describe" = list each photo with its link and have Claude describe the most recent ones; "links" = list only; "off" = ignore.
+SUMMARY_PHOTOS = "describe"
 GHL_TAG_SUMMARY = "conversation-summary-ready"
 GHL_TAG_SUMMARY_FAILED = "conversation-summary-failed"
 

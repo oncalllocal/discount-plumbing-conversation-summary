@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { channelOf, fetchContactHistory, normalizeMessage, parseChannels, type HistoryMessage } from "../src/ghl/conversations";
-import { DEFAULT_WINDOW_DAYS, entryStamp, fitTranscript, parseWindowDays, formatDay, formatStamp, getSummaryRecord, pickTimeZone, renderSummary, summarizeContact, transcriptLines, validateSummary, type SummaryData } from "../src/summary";
+import { channelOf, fetchContactHistory, normalizeMessage, parseAttachments, parseChannels, type HistoryMessage } from "../src/ghl/conversations";
+import { collectPhotos, isFetchableUrl, loadPhotoImages, MAX_ANALYZED, MAX_LISTED, parsePhotoMode, sniffImage, toBase64 } from "../src/photos";
+import { DEFAULT_WINDOW_DAYS, entryStamp, fitTranscript, parseWindowDays, formatDay, formatStamp, getSummaryRecord, pickTimeZone, applyPhotoMode, renderSummary, summarizeContact, transcriptLines, validateSummary, type SummaryData } from "../src/summary";
 import { handle, summaryContactId } from "../src/index";
 import type { Env } from "../src/env";
 
@@ -46,11 +47,13 @@ const MESSAGES = [
 interface Calls {
   ghl: { method: string; path: string; body?: unknown; version?: string }[];
   claude: unknown[];
+  /** Image URLs requested from outside GHL / Anthropic. */
+  img: string[];
 }
 
 /** Stub GHL + Anthropic. `pages` are GHL message pages newest-first, as the real API returns them. */
-function stubNetwork(opts: { pages?: unknown[][]; conversations?: unknown[]; summary?: unknown | ((n: number) => unknown); contact?: Record<string, unknown> | null; failWrites?: boolean; searchStatus?: number } = {}) {
-  const calls: Calls = { ghl: [], claude: [] };
+function stubNetwork(opts: { pages?: unknown[][]; conversations?: unknown[]; summary?: unknown | ((n: number) => unknown); contact?: Record<string, unknown> | null; failWrites?: boolean; searchStatus?: number; images?: Record<string, { status?: number; type?: string; bytes?: Uint8Array; headers?: Record<string, string>; throws?: boolean }> } = {}) {
+  const calls: Calls = { ghl: [], claude: [], img: [] };
   const pages = opts.pages ?? [[...MESSAGES].reverse()];
   const summary =
     opts.summary ??
@@ -73,6 +76,13 @@ function stubNetwork(opts: { pages?: unknown[][]; conversations?: unknown[]; sum
       calls.claude.push(body);
       const input = typeof summary === "function" ? (summary as (n: number) => unknown)(claudeN) : summary;
       return Response.json({ id: "msg", model: "claude-sonnet-5", stop_reason: "tool_use", content: [{ type: "tool_use", id: `tu${claudeN}`, name: "submit_conversation_summary", input }], usage: { input_tokens: 10, output_tokens: 10 } });
+    }
+    if (u.host !== "services.leadconnectorhq.com") {
+      calls.img.push(String(url));
+      const im = opts.images?.[String(url)];
+      if (!im) return new Response("not found", { status: 404 });
+      if (im.throws) throw new Error("connection reset");
+      return new Response(im.bytes ?? new Uint8Array(), { status: im.status ?? 200, headers: { "content-type": im.type ?? "image/jpeg", ...(im.headers ?? {}) } });
     }
     const path = u.pathname + u.search;
     const method = String(init.method || "GET");
@@ -744,5 +754,287 @@ describe("trigger tag cleanup (remove_tag)", () => {
       await Promise.all(pending);
       expect(trigDeletes(calls)).toHaveLength(1);
     });
+  });
+});
+
+// ───────────────────────── pictures (MMS) ─────────────────────────
+
+const JPEG = (extra = 0) => new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, ...new Array(extra).fill(7)]);
+const PNG = () => new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d]);
+const HEIC = () => new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63, 0, 0]);
+const U1 = "https://storage.googleapis.com/msgsndr/loc/media/leak1.jpeg";
+const U2 = "https://storage.googleapis.com/msgsndr/loc/media/rust2.png";
+const U3 = "https://storage.googleapis.com/msgsndr/loc/media/clip3.mp4";
+
+describe("attachments", () => {
+  it("parses GHL's attachment list leniently, keeping public http(s) links once each", () => {
+    expect(parseAttachments([U1, { url: U2 }, { URL: U3 }, U1, "ftp://x/y.jpg", "javascript:alert(1)", "not a url", 5, null, {}])).toEqual([
+      { url: U1, kind: "image" },
+      { url: U2, kind: "image" },
+      { url: U3, kind: "other" },
+    ]);
+    expect(parseAttachments(U1)).toEqual([{ url: U1, kind: "image" }]);
+    expect(parseAttachments("https://cdn.example.com/media/abc123")).toEqual([{ url: "https://cdn.example.com/media/abc123", kind: "unknown" }]);
+    expect(parseAttachments("https://cdn.example.com/a.JPG?token=1")).toEqual([{ url: "https://cdn.example.com/a.JPG?token=1", kind: "image" }]);
+    expect([parseAttachments(undefined), parseAttachments(null), parseAttachments([]), parseAttachments({})]).toEqual([[], [], [], []]);
+    expect(parseAttachments(Array.from({ length: 40 }, (_, i) => `https://x.com/${i}.jpg`))).toHaveLength(20);
+  });
+
+  it("a picture-only text is kept (empty body); an empty text with nothing attached is still dropped", () => {
+    const sms = new Set(["sms"] as const);
+    const m = normalizeMessage({ id: "p1", dateAdded: "2026-10-03T19:20:00Z", body: "", direction: "inbound", messageType: "TYPE_SMS", status: "delivered", attachments: [U1] }, sms);
+    expect(m).toMatchObject({ id: "p1", dir: "in", body: "", attachments: [{ url: U1, kind: "image" }] });
+    expect(normalizeMessage({ id: "p2", dateAdded: "2026-10-03T19:20:00Z", body: " ", direction: "inbound", messageType: "TYPE_SMS", attachments: [] }, sms)).toBeNull();
+    // a failed picture message never reached anyone
+    expect(normalizeMessage({ id: "p3", dateAdded: "2026-10-03T19:20:00Z", body: "", direction: "outbound", messageType: "TYPE_SMS", status: "failed", attachments: [U1] }, sms)).toBeNull();
+  });
+
+  it("numbers photos across the history in the order sent", () => {
+    const sms = new Set(["sms"] as const);
+    const mk = (id: string, at: string, body: string, att: string[], direction = "inbound") => normalizeMessage({ id, dateAdded: at, body, direction, messageType: "TYPE_SMS", status: "delivered", attachments: att }, sms)!;
+    const msgs = [mk("a", "2026-10-03T19:00:00Z", "hi", []), mk("b", "2026-10-03T19:01:00Z", "", [U1, U2]), mk("c", "2026-10-03T19:02:00Z", "and a video", [U3], "outbound")];
+    expect(collectPhotos(msgs).map((p) => [p.n, p.message, p.kind, p.dir])).toEqual([[1, 2, "image", "in"], [2, 2, "image", "in"], [3, 3, "other", "out"]]);
+    const lines = transcriptLines(msgs, TZ, "Jane", new Set([1]));
+    expect(lines[1].text).toContain("LEAD (Jane): (no text)  [sent: Photo 1, Photo 2 (not shown to you)]");
+    expect(lines[2].text).toContain("[sent: Attachment 3 (file, not shown to you)]");
+    expect(lines[0].text).not.toContain("[sent");
+  });
+
+  it('"off" mode ignores attachments and drops texts that were only a picture', () => {
+    const sms = new Set(["sms"] as const);
+    const a = normalizeMessage({ id: "a", dateAdded: "2026-10-03T19:00:00Z", body: "hi", direction: "inbound", messageType: "TYPE_SMS", attachments: [U1] }, sms)!;
+    const b = normalizeMessage({ id: "b", dateAdded: "2026-10-03T19:01:00Z", body: "", direction: "inbound", messageType: "TYPE_SMS", attachments: [U2] }, sms)!;
+    const out = applyPhotoMode([a, b], "off");
+    expect(out).toHaveLength(1);
+    expect(out[0].attachments).toEqual([]);
+    expect(applyPhotoMode([a, b], "describe")).toHaveLength(2);
+    expect(applyPhotoMode([a, b], "links")).toHaveLength(2);
+  });
+});
+
+describe("photo downloading", () => {
+  const photo = (n: number, url: string, kind: "image" | "other" | "unknown" = "image") => ({ n, message: n, url, kind, at: "2026-10-03T19:00:00Z", dir: "in" as const });
+
+  it("recognises image formats by their bytes, not the server's say-so", () => {
+    expect(sniffImage(JPEG())).toBe("image/jpeg");
+    expect(sniffImage(PNG())).toBe("image/png");
+    expect(sniffImage(new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0]))).toBe("image/gif");
+    expect(sniffImage(new Uint8Array([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x45, 0x42, 0x50]))).toBe("image/webp");
+    expect(sniffImage(HEIC())).toBe("heic");
+    expect(sniffImage(new TextEncoder().encode("<html>nope</html>"))).toBeNull();
+    expect(sniffImage(new Uint8Array([1, 2, 3]))).toBeNull();
+    expect(toBase64(new Uint8Array([104, 105]))).toBe("aGk=");
+    expect(toBase64(new Uint8Array(100_000).fill(65)).length).toBe(133_336); // survives big inputs without blowing the call stack
+  });
+
+  it("only fetches public https addresses on a named host", () => {
+    expect(isFetchableUrl(U1)).toBe(true);
+    for (const bad of ["http://storage.googleapis.com/a.jpg", "https://127.0.0.1/a.jpg", "https://10.0.0.5/a.jpg", "https://localhost/a.jpg", "https://[::1]/a.jpg", "https://intranet/a.jpg", "https://box.local/a.jpg", "https://svc.internal/a.jpg", "nonsense"]) expect(isFetchableUrl(bad)).toBe(false);
+  });
+
+  it("downloads images and reports a reason for every one it can't use", async () => {
+    const calls = stubNetwork({
+      images: {
+        [U1]: { bytes: JPEG(5), type: "application/octet-stream" }, // wrong content-type: bytes decide
+        [U2]: { bytes: PNG() },
+        "https://x.com/gone.jpg": { status: 404 },
+        "https://x.com/huge.jpg": { bytes: JPEG(), headers: { "content-length": "9000000" } },
+        "https://x.com/iphone.jpg": { bytes: HEIC() },
+        "https://x.com/page.jpg": { bytes: new TextEncoder().encode("<html>login required</html>") },
+        "https://x.com/reset.jpg": { throws: true },
+      },
+    });
+    const photos = [photo(1, U1), photo(2, U2), photo(3, "https://x.com/gone.jpg"), photo(4, "https://x.com/huge.jpg"), photo(5, "https://x.com/iphone.jpg"), photo(6, "https://x.com/page.jpg"), photo(7, "https://x.com/reset.jpg"), photo(8, "http://insecure.example.com/a.jpg"), photo(9, U3, "other")];
+    const r = await loadPhotoImages(photos);
+    expect(r.images.map((i) => [i.n, i.mediaType])).toEqual([[1, "image/jpeg"], [2, "image/png"]]);
+    expect(r.skipped.get(3)).toMatch(/HTTP 404/);
+    expect(r.skipped.get(4)).toMatch(/too large/);
+    expect(r.skipped.get(5)).toMatch(/HEIC/);
+    expect(r.skipped.get(6)).toMatch(/not an image/);
+    expect(r.skipped.get(7)).toMatch(/couldn't be downloaded/);
+    expect(r.skipped.get(8)).toMatch(/public https/);
+    expect(r.skipped.has(9)).toBe(false); // a video isn't a candidate at all
+    expect(calls.img).not.toContain(U3);
+    expect(calls.img).not.toContain("http://insecure.example.com/a.jpg");
+  });
+
+  it("an oversize body is rejected even when the server doesn't declare its length", async () => {
+    stubNetwork({ images: { [U1]: { bytes: JPEG(4_600_000) } } });
+    const r = await loadPhotoImages([photo(1, U1)]);
+    expect(r.images).toEqual([]);
+    expect(r.skipped.get(1)).toMatch(/too large/);
+  });
+
+  it(`looks at the ${MAX_ANALYZED} most recent photos and says so for the rest`, async () => {
+    const urls = Array.from({ length: 11 }, (_, i) => `https://x.com/p${i + 1}.jpg`);
+    const calls = stubNetwork({ images: Object.fromEntries(urls.map((u) => [u, { bytes: JPEG() }])) });
+    const r = await loadPhotoImages(urls.map((u, i) => photo(i + 1, u)));
+    expect(r.images.map((i) => i.n)).toEqual([4, 5, 6, 7, 8, 9, 10, 11]);
+    expect([...r.skipped.keys()]).toEqual([1, 2, 3]);
+    expect(r.skipped.get(1)).toMatch(/8 most recent/);
+    expect(calls.img).toHaveLength(8);
+  });
+
+  it("parses the photo mode setting", () => {
+    expect([parsePhotoMode("describe"), parsePhotoMode(" LINKS "), parsePhotoMode("off")]).toEqual(["describe", "links", "off"]);
+    for (const bad of [undefined, null, "", "on", "yes", 1]) expect(parsePhotoMode(bad)).toBeNull();
+  });
+});
+
+describe("photos in the summary", () => {
+  const sms = new Set(["sms"] as const);
+  const mk = (id: string, at: string, body: string, att: string[], direction = "inbound") => normalizeMessage({ id, dateAdded: at, body, direction, messageType: "TYPE_SMS", status: "delivered", attachments: att }, sms)!;
+  const THREAD = () => [
+    mk("t1", "2026-10-03T19:14:00Z", "My water heater is leaking, see the pictures", [U1, U2]),
+    mk("t2", "2026-10-03T19:16:00Z", "Thanks, we can be there tomorrow morning.", [], "outbound"),
+    mk("t3", "2026-10-03T19:20:00Z", "Here is the model plate", ["https://storage.googleapis.com/msgsndr/loc/media/plate3.jpg", U3]),
+  ];
+  const withPhotos = (photos: SummaryData["photos"]): SummaryData => ({ headline: "Leak.", lead: { looking_for: "", location: "", timing: "", contact_preference: "" }, timeline: [{ from: 1, to: 3, summary: "Lead texted photos (Photo 1, Photo 2) of a leaking water heater." }], outcome: "Visit offered.", next_step: "", photos });
+  const PLATE = "https://storage.googleapis.com/msgsndr/loc/media/plate3.jpg";
+
+  it("validates that only shown photos are described, once each, and every shown photo is", () => {
+    const ok = withPhotos([{ photo: 1, description: "Water pooled under the tank." }, { photo: 2, description: "Rust on the fittings." }]);
+    expect(validateSummary(ok, 3, new Set([1, 2]))).toEqual([]);
+    expect(validateSummary(withPhotos([{ photo: 1, description: "x" }]), 3, new Set([1, 2])).join()).toMatch(/Photo 2 was shown to you but has no entry/);
+    expect(validateSummary(withPhotos([{ photo: 9, description: "x" }]), 3, new Set([1])).join()).toMatch(/photos\[0\]\.photo must be the number of a photo you were shown/);
+    expect(validateSummary(withPhotos([{ photo: 1, description: "a" }, { photo: 1, description: "b" }]), 3, new Set([1])).join()).toMatch(/described twice/);
+    expect(validateSummary(withPhotos([{ photo: 1, description: " " }]), 3, new Set([1])).join()).toMatch(/description is empty/);
+    expect(validateSummary(withPhotos(undefined), 3, new Set())).toEqual([]); // nothing shown, nothing expected
+    expect(validateSummary(withPhotos([{ photo: 1, description: "invented" }]), 3, new Set()).join()).toMatch(/none were shown/);
+  });
+
+  it("renders a PHOTOS section: description + link when seen, a reason when not, plain links for files", () => {
+    const msgs = THREAD();
+    const skipped = new Map([[2, "file is too large to analyze"]]);
+    const out = renderSummary(withPhotos([{ photo: 1, description: "Water pooled under the tank." }, { photo: 3, description: "Model plate reads XG40T06." }]), msgs, { leadName: "Jane", tz: TZ, generatedAt: "", photos: collectPhotos(msgs), skipped, photoMode: "describe" });
+    expect(out).toContain("PHOTOS & ATTACHMENTS (4)");
+    expect(out).toContain(`• Photo 1 (sent by lead, Oct 3, 2:14 PM CDT): Water pooled under the tank.\n  ${U1}`);
+    expect(out).toContain(`• Photo 2 (sent by lead, Oct 3, 2:14 PM CDT) (not described: file is too large to analyze)\n  ${U2}`);
+    expect(out).toContain(`• Photo 3 (sent by lead, Oct 3, 2:20 PM CDT): Model plate reads XG40T06.\n  ${PLATE}`);
+    expect(out).toContain(`• Attachment 4 (sent by lead, Oct 3, 2:20 PM CDT)\n  ${U3}`);
+    expect(out.indexOf("PHOTOS")).toBeGreaterThan(out.indexOf("TIMELINE"));
+    expect(out.indexOf("PHOTOS")).toBeLessThan(out.indexOf("OUTCOME"));
+    // links mode: just the links, no "not described" noise
+    const links = renderSummary(withPhotos([]), msgs, { leadName: "", tz: TZ, generatedAt: "", photos: collectPhotos(msgs), skipped: new Map(), photoMode: "links" });
+    expect(links).toContain(`• Photo 1 (sent by lead, Oct 3, 2:14 PM CDT)\n  ${U1}`);
+    expect(links).not.toContain("not described");
+    // no photos: no section
+    expect(renderSummary(withPhotos([]), msgs, { leadName: "", tz: TZ, generatedAt: "" })).not.toContain("PHOTOS");
+    expect(renderSummary(withPhotos([]), msgs, { leadName: "", tz: TZ, generatedAt: "", photos: collectPhotos(msgs.slice(0, 1)) })).toContain("PHOTOS (2)");
+  });
+
+  it(`caps the list at ${MAX_LISTED} and says how many weren't listed`, () => {
+    const many = [mk("m", "2026-10-03T19:00:00Z", "pics", Array.from({ length: 20 }, (_, i) => `https://x.com/a${i}.jpg`)), mk("n", "2026-10-03T19:01:00Z", "more", Array.from({ length: 20 }, (_, i) => `https://x.com/b${i}.jpg`))];
+    const out = renderSummary({ ...withPhotos([]), timeline: [{ from: 1, to: 2, summary: "Photos sent." }] }, many, { leadName: "", tz: TZ, generatedAt: "", photos: collectPhotos(many) });
+    expect(out).toContain("PHOTOS (40)");
+    expect(out).toContain("…and 10 more not listed");
+    expect(out).not.toContain("Photo 31 ");
+  });
+
+  const Q = { headline: "Leak.", lead: { looking_for: "", location: "", timing: "", contact_preference: "" }, timeline: [{ from: 1, to: 3, summary: "Lead texted photos (Photo 1, Photo 2) of a leaking water heater." }], outcome: "Visit offered.", next_step: "" };
+  const images = () => ({ [U1]: { bytes: JPEG(3) }, [U2]: { bytes: PNG() }, [PLATE]: { bytes: JPEG(9) } });
+  const NOW = () => new Date("2026-10-07T20:00:00Z");
+
+  it("describe mode: Claude is shown the photos (labeled, with who sent them) and the summary lists them with descriptions", async () => {
+    const { env } = mkEnv();
+    const calls = stubNetwork({
+      pages: [[...THREAD()].reverse().map((m) => ({ id: m.id, dateAdded: m.at, body: m.body, direction: m.dir === "in" ? "inbound" : "outbound", messageType: "TYPE_SMS", status: "delivered", attachments: m.attachments.map((a) => a.url) }))],
+      images: images(),
+      summary: { ...Q, photos: [{ photo: 1, description: "Water pooled under the tank." }, { photo: 2, description: "Heavy rust on the fittings." }, { photo: 3, description: "Model plate, number readable." }] },
+    });
+    const r = await summarizeContact(env, CID, { now: NOW, dryRun: true });
+    expect(r.status).toBe("ok");
+    expect(r.photos).toEqual({ mode: "describe", total: 4, described: 3 });
+    const req = calls.claude[0] as { messages: { content: { type: string; text?: string; source?: { media_type: string; data: string } }[] }[] };
+    const blocks = req.messages[0].content;
+    expect(blocks.filter((b) => b.type === "image").map((b) => b.source!.media_type)).toEqual(["image/jpeg", "image/png", "image/jpeg"]);
+    expect(blocks.find((b) => b.type === "image")!.source!.data).toBe(toBase64(JPEG(3)));
+    const labels = blocks.filter((b) => b.type === "text").map((b) => b.text);
+    expect(labels).toContain("Photo 1 (sent in message [1] by the LEAD):");
+    expect(labels[0]).toContain("[1] Oct 3, 2:14 PM CDT | LEAD (Jane): My water heater is leaking, see the pictures  [sent: Photo 1, Photo 2]");
+    expect(labels[0]).toContain("Attachment 4 (file, not shown to you)");
+    expect(r.summary).toContain(`• Photo 1 (sent by lead, Oct 3, 2:14 PM CDT): Water pooled under the tank.\n  ${U1}`);
+    expect(r.summary).toContain(`• Attachment 4`);
+    expect(r.summary).toContain("(Photo 1, Photo 2)");
+    expect(JSON.stringify(calls.claude[0])).toContain("quoted data");
+  });
+
+  it("links mode lists the links and never downloads or shows an image; off mode ignores them entirely", async () => {
+    const pages = [[...THREAD()].reverse().map((m) => ({ id: m.id, dateAdded: m.at, body: m.body, direction: m.dir === "in" ? "inbound" : "outbound", messageType: "TYPE_SMS", status: "delivered", attachments: m.attachments.map((a) => a.url) }))];
+    const { env } = mkEnv({ SUMMARY_PHOTOS: "links" });
+    const l = stubNetwork({ pages, images: images(), summary: Q });
+    const r = await summarizeContact(env, CID, { now: NOW, dryRun: true });
+    expect(l.img).toEqual([]);
+    expect(JSON.stringify(l.claude[0])).not.toContain('"type":"image"');
+    expect(r.summary).toContain(`• Photo 1 (sent by lead, Oct 3, 2:14 PM CDT)\n  ${U1}`);
+    expect(r.photos).toEqual({ mode: "links", total: 4, described: 0 });
+
+    // a request can override the setting; "off" drops the attachments (and the picture-only text)
+    const off = stubNetwork({ pages, images: images(), summary: Q });
+    const o = await summarizeContact(env, CID, { now: NOW, dryRun: true, photos: "off" });
+    expect(off.img).toEqual([]);
+    expect(o.summary).not.toContain("PHOTOS");
+    expect(o.summary).not.toContain("storage.googleapis.com");
+    expect(o.photos).toEqual({ mode: "off", total: 0, described: 0 });
+  });
+
+  it("a photo that can't be downloaded doesn't fail the run: it's listed with the reason", async () => {
+    const { env } = mkEnv();
+    stubNetwork({
+      pages: [[...THREAD()].reverse().map((m) => ({ id: m.id, dateAdded: m.at, body: m.body, direction: m.dir === "in" ? "inbound" : "outbound", messageType: "TYPE_SMS", status: "delivered", attachments: m.attachments.map((a) => a.url) }))],
+      images: { [U1]: { bytes: JPEG() }, [U2]: { status: 403 }, [PLATE]: { bytes: HEIC() } },
+      summary: { ...Q, photos: [{ photo: 1, description: "Water pooled under the tank." }] },
+    });
+    const r = await summarizeContact(env, CID, { now: NOW, dryRun: true });
+    expect(r.status).toBe("ok");
+    expect(r.summary).toContain("Photo 1 (sent by lead, Oct 3, 2:14 PM CDT): Water pooled under the tank.");
+    expect(r.summary).toContain("(not described: couldn't be downloaded (HTTP 403))");
+    expect(r.summary).toContain("(not described: iPhone HEIC format can't be analyzed)");
+  });
+
+  it("never describes a photo Claude wasn't shown (an invented description is dropped, not published)", async () => {
+    const { env } = mkEnv();
+    stubNetwork({
+      pages: [[...THREAD()].reverse().map((m) => ({ id: m.id, dateAdded: m.at, body: m.body, direction: m.dir === "in" ? "inbound" : "outbound", messageType: "TYPE_SMS", status: "delivered", attachments: m.attachments.map((a) => a.url) }))],
+      images: { [U1]: { bytes: JPEG() }, [U2]: { status: 404 }, [PLATE]: { status: 404 } },
+      summary: { ...Q, photos: [{ photo: 1, description: "Real description." }, { photo: 2, description: "Made up: I never saw this one." }] },
+    });
+    const r = await summarizeContact(env, CID, { now: NOW, dryRun: true });
+    expect(r.summary).toContain("Real description.");
+    expect(r.summary).not.toContain("Made up");
+  });
+
+  it("a new picture changes the fingerprint, so the summary regenerates", async () => {
+    const { env } = mkEnv();
+    const pg = (att: string[]) => [[{ id: "x1", dateAdded: "2026-10-03T19:14:00Z", body: "look", direction: "inbound", messageType: "TYPE_SMS", status: "delivered", attachments: att }]];
+    stubNetwork({ pages: pg([U1]), images: images(), summary: { ...Q, timeline: [{ from: 1, to: 1, summary: "s" }], photos: [{ photo: 1, description: "d" }] } });
+    expect((await summarizeContact(env, CID, { now: NOW })).status).toBe("ok");
+    stubNetwork({ pages: pg([U1]), images: images(), contact: { customFields: [{ id: "f1", value: "existing" }] } });
+    expect((await summarizeContact(env, CID, { now: NOW })).status).toBe("unchanged");
+    const c = stubNetwork({ pages: pg([U1, U2]), images: images(), contact: { customFields: [{ id: "f1", value: "existing" }] }, summary: { ...Q, timeline: [{ from: 1, to: 1, summary: "s" }], photos: [{ photo: 1, description: "d" }, { photo: 2, description: "e" }] } });
+    expect((await summarizeContact(env, CID, { now: NOW })).status).toBe("ok");
+    expect(c.claude).toHaveLength(1);
+  });
+
+  it("an unchanged conversation doesn't re-download its photos", async () => {
+    const { env } = mkEnv();
+    const pg = [[{ id: "x1", dateAdded: "2026-10-03T19:14:00Z", body: "look", direction: "inbound", messageType: "TYPE_SMS", status: "delivered", attachments: [U1] }]];
+    stubNetwork({ pages: pg, images: images(), summary: { ...Q, timeline: [{ from: 1, to: 1, summary: "s" }], photos: [{ photo: 1, description: "d" }] } });
+    await summarizeContact(env, CID, { now: NOW });
+    const again = stubNetwork({ pages: pg, images: images(), contact: { customFields: [{ id: "f1", value: "existing" }] } });
+    expect((await summarizeContact(env, CID, { now: NOW })).status).toBe("unchanged");
+    expect(again.img).toEqual([]);
+    expect(again.claude).toHaveLength(0);
+  });
+
+  it("the endpoint takes photos (body, query or customData) and rejects nonsense", async () => {
+    const { env } = mkEnv();
+    stubNetwork();
+    const post = (body: unknown, qs = "") => new Request(`https://x.dev/summarize?token=secret${qs}`, { method: "POST", body: JSON.stringify(body) });
+    for (const [b, qs] of [[{ contact_id: CID, dry_run: true, photos: "off" }, ""], [{ contact_id: CID, dry_run: true }, "&photos=off"], [{ customData: { contact_id: CID, photos: "off" }, dry_run: true }, ""]] as const) {
+      const r = (await (await handle(post(b, qs), env)).json()) as { photos?: { mode: string } };
+      expect(r.photos?.mode).toBe("off");
+    }
+    for (const bad of ["yes", "ON", 5, true]) expect((await handle(post({ contact_id: CID, photos: bad }), env)).status).toBe(400);
   });
 });
