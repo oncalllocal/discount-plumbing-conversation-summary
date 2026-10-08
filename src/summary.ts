@@ -265,7 +265,7 @@ export async function summarizeMessages(env: Env, messages: HistoryMessage[], le
 // ───────────────────────── Pipeline ─────────────────────────
 
 /** Default look-back for a summary. */
-export const DEFAULT_WINDOW_DAYS = 35;
+export const DEFAULT_WINDOW_DAYS = 65;
 
 /**
  * Parse a look-back window: a whole number of days (1–3650), or 0 / "all" / "none" for no limit.
@@ -323,7 +323,7 @@ export interface SummarizeOptions {
   force?: boolean;
   /** Build the summary but write nothing to GHL. */
   dryRun?: boolean;
-  /** Look-back window in days (0 = no limit); defaults to SUMMARY_WINDOW_DAYS, else 35. */
+  /** Look-back window in days (0 = no limit); defaults to SUMMARY_WINDOW_DAYS, else 65. */
   days?: number;
   /**
    * The GHL tag that triggered this run. Removed once the run finishes (whatever the outcome, unless it was

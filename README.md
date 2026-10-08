@@ -17,14 +17,14 @@ TIMELINE
 
 OUTCOME: Appointment confirmed for Monday at 9 AM.
 
-Based on 5 text messages from the last 35 days (Oct 3, 2026 – Oct 4, 2026). Last message Oct 4, 2026, 9:30 AM CDT.
+Based on 5 text messages from the last 65 days (Oct 3, 2026 – Oct 4, 2026). Last message Oct 4, 2026, 9:30 AM CDT.
 ```
 
 It fills the **Conversation Summary** contact field (Large Text), adds the same text as a contact note, and then adds the tag **`conversation-summary-ready`**, which a second GHL workflow can use to email the client.
 
 ## How it stays accurate
 
-- **Only the last 35 days.** Older texts are ignored, so an old, finished conversation never leaks into a new lead's summary. GHL returns messages newest first, so the tool stops reading as soon as it passes the cutoff (and skips whole conversations that haven't had a message in the window), which keeps it fast on long histories. The footer says which window was used. If several separate matters fall inside the window, each gets its own timeline entries, the headline says so, and the outcome and next step follow the most recent one. Change the default with `SUMMARY_WINDOW_DAYS` in `wrangler.toml`, or per request with `"days"` (see API).
+- **Only the last 65 days.** Older texts are ignored, so an old, finished conversation never leaks into a new lead's summary. GHL returns messages newest first, so the tool stops reading as soon as it passes the cutoff (and skips whole conversations that haven't had a message in the window), which keeps it fast on long histories. The footer says which window was used. If several separate matters fall inside the window, each gets its own timeline entries, the headline says so, and the outcome and next step follow the most recent one. Change the default with `SUMMARY_WINDOW_DAYS` in `wrangler.toml`, or per request with `"days"` (see API).
 - **Claude never writes a date.** It points at message numbers, and the code stamps each timeline entry from that message's real timestamp in the contact's time zone. A pointer to a message that doesn't exist is repaired or dropped.
 - Only what the texts say. Unstated details are left out. The lead's messages are passed as quoted data, never as instructions.
 - Failed / undelivered texts are skipped.
@@ -119,13 +119,13 @@ GET  /check              read-only probe of the token's scopes
 GET  /healthz
 ```
 
-`days` is the look-back window: a whole number from 1 to 3650, or `0` / `"all"` for no limit (default `SUMMARY_WINDOW_DAYS`, 35). It can also be sent as `?days=` or in `customData`. A bad value returns 400. A contact with no texts inside the window gets status `empty` (no field, note or tag).
+`days` is the look-back window: a whole number from 1 to 3650, or `0` / `"all"` for no limit (default `SUMMARY_WINDOW_DAYS`, 65). It can also be sent as `?days=` or in `customData`. A bad value returns 400. A contact with no texts inside the window gets status `empty` (no field, note or tag).
 
 `remove_tag` is the GHL tag that triggered the run; it is removed from the contact when the run finishes (not on a dry run) so adding it again fires again. It can't be one of this tool's own output tags (400). Also accepted as `?remove_tag=` or in `customData`.
 
 `/api/conversation-summary` is an alias of `/summarize` (and of `/status/:id`).
 
-Settings (`wrangler.toml`): `SUMMARY_WINDOW_DAYS` (default `35`), `SUMMARY_CHANNELS` (default `sms`; any of `sms,email,call,chat`), `SUMMARY_TIMEZONE`, `GHL_TAG_SUMMARY`, `GHL_TAG_SUMMARY_FAILED`, `CLAUDE_MODEL`, `BUSINESS_NAME`.
+Settings (`wrangler.toml`): `SUMMARY_WINDOW_DAYS` (default `65`), `SUMMARY_CHANNELS` (default `sms`; any of `sms,email,call,chat`), `SUMMARY_TIMEZONE`, `GHL_TAG_SUMMARY`, `GHL_TAG_SUMMARY_FAILED`, `CLAUDE_MODEL`, `BUSINESS_NAME`.
 
 ## Development
 
